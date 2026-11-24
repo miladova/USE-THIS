@@ -11,9 +11,11 @@
 
 ## Read it
 
-**→ [`The-Fifth-Officer.md`](The-Fifth-Officer.md)** — the complete manuscript, front matter to coda, in one file.
+**→ [`The-Fifth-Officer.pdf`](The-Fifth-Officer.pdf)** — 132 pages, 6×9 in, typeset in EB Garamond. Title page, contents, running heads, folios. This is the one to read or print.
 
-Individual chapters are in [`chapters/`](chapters/). Rebuild the single-file manuscript with `python3 build.py`.
+**→ [`The-Fifth-Officer.md`](The-Fifth-Officer.md)** — the complete manuscript as plain markdown, front matter to coda, in one file.
+
+Individual chapters are in [`chapters/`](chapters/). Rebuild the single-file manuscript with `python3 build.py`; rebuild the PDF with `pip install reportlab && python3 make_pdf.py`.
 
 ---
 
