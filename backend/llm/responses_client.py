@@ -103,6 +103,58 @@ class ResponsesClient(OpenAICompatibleClient):
             except Exception as exc:
                 raise self._map_error(exc, model) from exc
 
+    async def web_search_text(self, request: LLMRequest) -> LLMResponse:
+        """Generate a history dossier using OpenAI's native, citation-producing web search.
+
+        Args:
+            request: Non-streaming research prompt and generation settings.
+        Returns:
+            Text plus claim-linked HTTPS sources returned by the Responses API.
+        """
+        request = self._apply_defaults(request.model_copy(update={"stream": False}))
+        model = self._resolve_model(request)
+        with LLMCall(self.provider_name, model, "web_search", use_system_proxy=self.config.use_system_proxy) as call:
+            start = time.perf_counter()
+            try:
+                params = self._build_params(request)
+                params["tools"] = [{"type": "web_search", "search_context_size": "high"}]
+                params["include"] = ["web_search_call.action.sources"]
+                response = await self._create_response(params, stream=False)
+                observe_provider_response(response, self.config.resolved_api_mode)
+                self._check_response(response, model)
+                text = response.output_text or ""
+                sources: dict[str, dict[str, Any]] = {}
+                for item in response.output:
+                    if item.type != "message":
+                        continue
+                    for part in item.content:
+                        if part.type != "output_text":
+                            continue
+                        for annotation in part.annotations:
+                            if annotation.type != "url_citation":
+                                continue
+                            url = annotation.url
+                            entry = sources.setdefault(url, {"url": url, "title": annotation.title or url, "claims": []})
+                            start_at = max(0, annotation.start_index - 240)
+                            end_at = min(len(text), annotation.end_index + 240)
+                            excerpt = text[start_at:end_at].strip()
+                            if excerpt:
+                                entry["claims"].append(excerpt)
+                source_list = list(sources.values())
+                result = LLMResponse(
+                    content=text,
+                    raw_response={"web_sources": source_list},
+                    usage=self._extract_usage(response.usage), model=response.model or model,
+                    provider=self.provider_name, duration_ms=int((time.perf_counter() - start) * 1000),
+                    finish_reason=response.status,
+                )
+                call.result = result
+                return result
+            except LLMError:
+                raise
+            except Exception as exc:
+                raise self._map_error(exc, model) from exc
+
     async def text_generate(self, request: LLMRequest) -> LLMResponse:
         """生成正文。
 

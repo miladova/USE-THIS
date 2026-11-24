@@ -22,6 +22,8 @@ CHAPTER_CHARACTER_RELATION_STATE_CHECK_SCOPE_FIELDS = {
 }
 CHAPTER_WORLD_RULES_CHECK_TASK = "check_chapter_world_rules_by_ai"
 CHAPTER_WORLD_RULES_CHECK_SCOPE_FIELDS = {"novel_id", "source", "rules"}
+CHAPTER_CONTINUITY_CHECK_TASK = "check_chapter_continuity_by_ai"
+CHAPTER_CONTINUITY_CHECK_SCOPE_FIELDS = {"novel_id", "source"}
 
 
 class ChapterCheckSourceV1(StrictRequestModel):
@@ -226,3 +228,43 @@ class ChapterWorldRulesCheckResultV1(StrictResponseModel):
     """空数组仅表示所选规则范围内没有报告疑点。"""
 
     issues: list[ChapterWorldRulesCheckIssueV1] = Field(max_length=10)
+
+
+# 章后连续性与逻辑检查：只固定章修订，服务端自动读取本章计划、父级规划与前文，
+# 不要求作者另选实体；结果只供作者审阅，不修改任何实体。
+CONTINUITY_CATEGORIES = ("continuity", "plan", "logic", "internal", "boundary")
+
+
+class ChapterContinuityCheckInputV1(StrictRequestModel):
+    """固定一个章修订；其余检查资料由服务端按阅读顺序自动读取。"""
+
+    novel_id: ObjectIdString
+    source: ChapterCheckSourceV1
+
+
+class ChapterContinuityCheckIssueV1(StrictResponseModel):
+    """模型只提供分类、疑点文字和本章原样引文，不产生身份或版本。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True, str_strip_whitespace=False)
+    category: str = Field(pattern=r"^(continuity|plan|logic|internal|boundary)$")
+    text: str = Field(min_length=1, max_length=2000)
+    start: int = Field(ge=0, le=2**31 - 1, description="从零开始的 Unicode 码点位置，不是 UTF-16 下标。")
+    quote: str = Field(min_length=1, max_length=10000)
+
+    @field_validator("text", mode="before")
+    @classmethod
+    def trim_text(cls, value):
+        """只清理疑点文字的首尾空白，引文保持原样。
+
+        Args:
+            value: 模型返回的疑点文字。
+        Returns:
+            首尾去空白后的字符串；非字符串由严格字段校验拒绝。
+        """
+        return value.strip() if isinstance(value, str) else value
+
+
+class ChapterContinuityCheckResultV1(StrictResponseModel):
+    """空数组仅表示本次资料范围内没有报告疑点，不代表本章已经无误。"""
+
+    issues: list[ChapterContinuityCheckIssueV1] = Field(max_length=20)

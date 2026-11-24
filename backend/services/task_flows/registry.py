@@ -27,6 +27,8 @@ from backend.services.novel.chapter_check_contract import (
     ChapterCharacterRelationStateCheckInputV1, ChapterCharacterRelationStateCheckResultV1, ChapterCharacterRelationStateCheckResultV2,
     CHAPTER_WORLD_RULES_CHECK_TASK, CHAPTER_WORLD_RULES_CHECK_SCOPE_FIELDS,
     ChapterWorldRulesCheckInputV1, ChapterWorldRulesCheckResultV1,
+    CHAPTER_CONTINUITY_CHECK_TASK, CHAPTER_CONTINUITY_CHECK_SCOPE_FIELDS,
+    ChapterContinuityCheckInputV1, ChapterContinuityCheckResultV1,
 )
 
 
@@ -152,6 +154,7 @@ TASKS = {
         TaskSpec(CHAPTER_ITEM_OWNER_CHECK_TASK, "章后物品持有人检查", "check_chapter_item_owner", ChapterItemOwnerCheckInputV1, ChapterItemOwnerCheckResultV1, "chapter.item_owner_check.result"),
         TaskSpec(CHAPTER_ITEM_OWNER_FACTS_CHECK_TASK, "章后物品事实转交检查", "check_chapter_item_owner_facts", ChapterItemOwnerCheckInputV1, ChapterItemOwnerCheckResultV1, "chapter.item_owner_check.result", 2),
         TaskSpec(CHAPTER_WORLD_RULES_CHECK_TASK, "章后世界规则疑点检查", "check_chapter_world_rules", ChapterWorldRulesCheckInputV1, ChapterWorldRulesCheckResultV1, "chapter.world_rules_check.result"),
+        TaskSpec(CHAPTER_CONTINUITY_CHECK_TASK, "章后连续性与逻辑检查", "check_chapter_continuity", ChapterContinuityCheckInputV1, ChapterContinuityCheckResultV1, "chapter.continuity_check.result"),
         TaskSpec(CHAPTER_CHARACTER_RELATION_STATE_CHECK_TASK, "章后人物关系检查", "check_chapter_character_relation_state", ChapterCharacterRelationStateCheckInputV1, ChapterCharacterRelationStateCheckResultV1, "chapter.character_relation_state_check.result"),
         TaskSpec(CHAPTER_CHARACTER_RELATION_FACTS_CHECK_TASK, "章后人物关系事实检查", "check_chapter_character_relation_facts", ChapterCharacterRelationStateCheckInputV1, ChapterCharacterRelationStateCheckResultV2, "chapter.character_relation_state_check.result", 2),
         TaskSpec("create_novel_by_ai", "AI 创建小说", "novel_meta", AICreateNovelRequestV1, NovelCreateFieldsV1, "novel.create_candidate"),
@@ -190,22 +193,82 @@ def validate_task_definition(flow):
 
     flow = validate_flow(flow)
     chapter_agents = [node for node in flow.nodes if node.type == "agent" and node.config.get("chapter_context_version") == 1]
+    if flow.task == "write_chapter_by_ai" and not chapter_agents:
+        raise FlowValidationError("章节写作必须使用带自动连续性审核与修正的本章资料流程")
     if chapter_agents:
         if flow.task != "write_chapter_by_ai" or len(chapter_agents) != 1 or flow.subflows:
             raise FlowValidationError("本章资料模式只支持单个章节整理节点，不支持子流程")
         agent = chapter_agents[0]
         models = [node for node in flow.nodes if node.type == "llm"]
         contexts = [node for node in flow.nodes if node.type == "context"]
-        if len(models) != 1 or len(contexts) != 2 or len([node for node in flow.nodes if node.type == "agent"]) != 1:
-            raise FlowValidationError("本章资料模式需要初始资料、一次整理、采用资料和一次正文生成")
+        if len(models) != 4 or len(contexts) != 2 or len([node for node in flow.nodes if node.type == "agent"]) != 1:
+            raise FlowValidationError("本章流程必须包含写作前历史研究、正文生成、成稿历史/连续性审核及自动修正")
+        model_by_id = {node.id: node for node in models}
+        researcher = model_by_id.get("historical_research")
+        generator = model_by_id.get("generate")
+        reviewer = model_by_id.get("continuity_review")
+        revision = model_by_id.get("auto_revise")
+        condition = next((node for node in flow.nodes if node.id == "needs_revision" and node.type == "condition"), None)
+        merge = next((node for node in flow.nodes if node.id == "final_content" and node.type == "merge"), None)
+        keep = next((node for node in flow.nodes if node.id == "keep_draft" and node.type == "compose"), None)
+        output = next((node for node in flow.nodes if node.type == "output"), None)
         sources = {(edge.target, edge.target_port): (edge.source, edge.source_port, tuple(edge.source_path)) for edge in flow.edges}
         prepared = next((node for node in contexts if "prepared_context" in node.inputs), None)
         initial = next((node for node in contexts if "prepared_context" not in node.inputs), None)
-        if (prepared is None or initial is None or set(models[0].inputs) != {"writing_context"}
+        builtin_nodes = {node.id: node for node in builtin_flow(flow.task).nodes}
+        protected_nodes = {"historical_research", "generate", "continuity_review", "auto_revise"}
+        protected_contract_changed = any(
+            node_id not in model_by_id or node_id not in builtin_nodes
+            or model_by_id[node_id].config.get("prompt") != builtin_nodes[node_id].config.get("prompt")
+            or model_by_id[node_id].inputs != builtin_nodes[node_id].inputs
+            or model_by_id[node_id].outputs != builtin_nodes[node_id].outputs
+            for node_id in protected_nodes
+        ) or any(
+            node_id not in {node.id for node in flow.nodes} or node_id not in builtin_nodes
+            or next(node for node in flow.nodes if node.id == node_id).type != builtin_nodes[node_id].type
+            or next(node for node in flow.nodes if node.id == node_id).inputs != builtin_nodes[node_id].inputs
+            or next(node for node in flow.nodes if node.id == node_id).outputs != builtin_nodes[node_id].outputs
+            or next(node for node in flow.nodes if node.id == node_id).config != builtin_nodes[node_id].config
+            for node_id in {"needs_revision", "keep_draft", "final_content", "result"}
+        )
+        if (prepared is None or initial is None or researcher is None or generator is None or reviewer is None or revision is None
+                or protected_contract_changed
+                or condition is None or merge is None or keep is None or output is None
+                or "private historical research desk" not in researcher.config.get("prompt", "").lower()
+                or researcher.config.get("private_output") is not True
+                or researcher.config.get("web_search_required") is not True
+                or "historical research dossier" not in generator.config.get("prompt", "").lower()
+                or "historical-authenticity audit" not in reviewer.config.get("prompt", "").lower()
+                or "mandatory historical research dossier" not in revision.config.get("prompt", "").lower()
+                or reviewer.config.get("review_evidence") != "chapter_continuity_v1"
+                or reviewer.config.get("disable_format_review") is not True
+                or reviewer.config.get("private_output") is not True
+                or set(generator.inputs) != {"writing_context", "historical_research"}
+                or set(researcher.inputs) != {"writing_context"}
+                or set(reviewer.inputs) != {"writing_context", "content", "historical_research"}
+                or set(revision.inputs) != {"writing_context", "content", "review", "historical_research"}
+                or sources.get((researcher.id, "writing_context")) != (prepared.id, "writing_context", ())
+                or sources.get((generator.id, "historical_research")) != (researcher.id, "historical_research", ())
+                or sources.get((reviewer.id, "historical_research")) != (researcher.id, "historical_research", ())
+                or sources.get((revision.id, "historical_research")) != (researcher.id, "historical_research", ())
                 or sources.get((agent.id, "writing_context")) != (initial.id, "writing_context", ())
                 or sources.get((prepared.id, "prepared_context")) != (agent.id, "prepared_context", ())
-                or sources.get((models[0].id, "writing_context")) != (prepared.id, "writing_context", ())):
-            raise FlowValidationError("正文只能直接使用整理后的单份本章资料，不能另接报告或工具历史")
+                or sources.get((generator.id, "writing_context")) != (prepared.id, "writing_context", ())
+                or sources.get((reviewer.id, "writing_context")) != (prepared.id, "writing_context", ())
+                or sources.get((reviewer.id, "content")) != (generator.id, "content", ())
+                or sources.get((revision.id, "writing_context")) != (prepared.id, "writing_context", ())
+                or sources.get((revision.id, "content")) != (generator.id, "content", ())
+                or sources.get((revision.id, "review")) != (reviewer.id, "review", ())
+                or sources.get((condition.id, "issues")) != (reviewer.id, "review", ("issues",))
+                or sources.get((keep.id, "content")) != (generator.id, "content", ())
+                or sources.get((merge.id, "revised")) != (revision.id, "content", ())
+                or sources.get((merge.id, "original")) != (keep.id, "content", ())
+                or sources.get((output.id, "content")) != (merge.id, "content", ())
+                or not any(edge.source == condition.id and edge.source_port == "yes" and edge.target == revision.id for edge in flow.control_edges)
+                or not any(edge.source == condition.id and edge.source_port == "no" and edge.target == keep.id for edge in flow.control_edges)
+                or not any(edge.source == revision.id and edge.target == merge.id for edge in flow.control_edges)
+                or not any(edge.source == keep.id and edge.target == merge.id for edge in flow.control_edges)):
+            raise FlowValidationError("章节必须先完成本章历史研究，再对初稿进行历史真实性、连续性和逻辑审核；有疑点时必须自动修正后再输出")
     if flow.task not in TASKS:
         raise FlowValidationError("未知业务任务")
     spec = TASKS[flow.task]
@@ -230,6 +293,8 @@ def validate_task_definition(flow):
         scope_fields = CHAPTER_CHARACTER_RELATION_STATE_CHECK_SCOPE_FIELDS
     if flow.task == CHAPTER_WORLD_RULES_CHECK_TASK:
         scope_fields = CHAPTER_WORLD_RULES_CHECK_SCOPE_FIELDS
+    if flow.task == CHAPTER_CONTINUITY_CHECK_TASK:
+        scope_fields = CHAPTER_CONTINUITY_CHECK_SCOPE_FIELDS
     allowed_parameters = set(spec.request_model.model_fields) - GENERATION_FIELDS - scope_fields - TRANSPORT_FIELDS
     context_definition = next((node for node in builtin_flow(flow.task).nodes if node.type == "context"), None)
     pending = [flow]
@@ -245,6 +310,8 @@ def validate_task_definition(flow):
                 raise FlowValidationError("章后人物关系检查不能使用 Agent 节点，请只使用选定章正文、关系和两名人物")
             if flow.task == CHAPTER_WORLD_RULES_CHECK_TASK and node.type == "agent":
                 raise FlowValidationError("章后世界规则检查不能使用 Agent 节点，请只使用选定章正文和规则")
+            if flow.task == CHAPTER_CONTINUITY_CHECK_TASK and node.type == "agent":
+                raise FlowValidationError("章后连续性检查不能使用 Agent 节点，请只使用选定章正文、本章计划、父级规划与前文")
             if graph is not flow and "candidate_check" in node.config:
                 raise FlowValidationError("候选检查只能声明在主流程中")
             if graph is not flow and "source_conflicts" in node.config:

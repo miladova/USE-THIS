@@ -344,8 +344,11 @@ async def execute_flow(
                 if trace:
                     metadata["active_control_ports"] = sorted(ports)
                 logger.info("[节点完成] label=%s duration=%dms", metadata["label"], int((time.perf_counter() - node_started) * 1000))
-                yield {"event": "step", "data": {**metadata, "state": "done", "cached": False, "outputs": outputs,
-                                                    "elapsed_ms": int((time.perf_counter() - node_started) * 1000)}}
+                step_result = {**metadata, "state": "done", "cached": False,
+                               "elapsed_ms": int((time.perf_counter() - node_started) * 1000)}
+                if not node.config.get("private_output"):
+                    step_result["outputs"] = outputs
+                yield {"event": "step", "data": step_result}
                 if node.type == "output":
                     candidate_fields = node.config.get("candidate_fields")
                     candidate = {name: node_inputs[source] for name, source in candidate_fields.items() if source in node_inputs} if candidate_fields is not None else dict(node_inputs)

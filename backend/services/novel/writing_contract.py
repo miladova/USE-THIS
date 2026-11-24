@@ -15,6 +15,9 @@ from backend.services.novel.item_fact_contract import ItemFactReadV1
 from backend.services.novel.faction_fact_contract import FactionFactReadV1
 
 
+CHAPTER_AUTO_REVIEW_MAX_REVISIONS = 3
+
+
 class WritingReadV1(StrictRequestModel):
     """一种固定语义的内容读取，包括空查询。"""
 

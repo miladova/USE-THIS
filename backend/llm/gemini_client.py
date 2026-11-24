@@ -208,6 +208,58 @@ class GeminiClient(BaseLLMClient):
         response.candidates = [candidate]
         return response
 
+    async def web_search_text(self, request: LLMRequest) -> LLMResponse:
+        """Generate a dossier with Gemini Google Search grounding and source-to-claim evidence.
+
+        Args:
+            request: Non-streaming research prompt and generation settings.
+        Returns:
+            Text and the grounded HTTPS citations returned by Gemini.
+        """
+        request = self._apply_defaults(request.model_copy(update={"stream": False}))
+        model = self._resolve_model(request)
+        with LLMCall(self.provider_name, model, "web_search", use_system_proxy=self.config.use_system_proxy) as call:
+            start = time.perf_counter()
+            try:
+                config = self._build_config(request)
+                config.tools = [types.Tool(google_search=types.GoogleSearch())]
+                response = await self._generate_content(
+                    stream=False, model=model, contents=self._build_contents(request), config=config,
+                )
+                observe_provider_response(response, self.config.resolved_api_mode)
+                text = response.text or ""
+                sources: dict[str, dict[str, Any]] = {}
+                candidate = response.candidates[0] if response.candidates else None
+                metadata = getattr(candidate, "grounding_metadata", None) if candidate else None
+                chunks = getattr(metadata, "grounding_chunks", None) or []
+                for support in getattr(metadata, "grounding_supports", None) or []:
+                    segment = getattr(getattr(support, "segment", None), "text", None)
+                    if not isinstance(segment, str) or len(segment.strip()) < 20:
+                        continue
+                    for chunk_index in getattr(support, "grounding_chunk_indices", None) or []:
+                        if not isinstance(chunk_index, int) or not 0 <= chunk_index < len(chunks):
+                            continue
+                        web = getattr(chunks[chunk_index], "web", None)
+                        url = getattr(web, "uri", None) if web else None
+                        title = getattr(web, "title", None) if web else None
+                        if isinstance(url, str) and isinstance(title, str):
+                            entry = sources.setdefault(url, {"url": url, "title": title, "claims": []})
+                            entry["claims"].append(segment.strip())
+                result = LLMResponse(
+                    content=text,
+                    raw_response={"web_sources": list(sources.values())},
+                    usage=self._extract_usage(response.usage_metadata), model=model,
+                    provider=self.provider_name, duration_ms=int((time.perf_counter() - start) * 1000),
+                    finish_reason=candidate.finish_reason.name if candidate and candidate.finish_reason else "",
+                )
+                call.result = result
+                return result
+            except LLMError:
+                raise
+            except Exception as exc:
+                mapped = self._map_error(exc, model)
+                raise mapped from exc
+
     async def text_generate(self, request: LLMRequest) -> LLMResponse:
         """调用 Gemini API 进行普通文本生成。"""
         request = self._apply_defaults(request)

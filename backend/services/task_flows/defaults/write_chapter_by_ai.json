@@ -1101,12 +1101,48 @@
       "config": {}
     },
     {
+      "id": "historical_research",
+      "type": "llm",
+      "label": "写作前自动历史研究",
+      "inputs": {
+        "writing_context": {
+          "type": "string"
+        }
+      },
+      "outputs": {
+        "historical_research": {
+          "type": "string",
+          "minLength": 200,
+          "maxLength": 12000,
+          "description": "本章写作前自动生成的历史研究档案；必须用于写作和成稿后的历史准确性核查。"
+        }
+      },
+      "values": {},
+      "config": {
+        "mode": "text",
+        "provider": "",
+        "model": "",
+        "parameters": {},
+        "prompt_file": "write_chapter_historical_research_prompt.md",
+        "preserve_prompt_whitespace": true,
+        "private_output": true,
+        "web_search_required": true,
+        "output_port": "historical_research"
+      }
+    },
+    {
       "id": "generate",
       "type": "llm",
       "label": "生成本章正文",
       "inputs": {
         "writing_context": {
           "type": "string"
+        },
+        "historical_research": {
+          "type": "string",
+          "minLength": 200,
+          "maxLength": 12000,
+          "description": "本章写作前自动生成的历史研究档案；必须用于写作和成稿后的历史准确性核查。"
         }
       },
       "outputs": {
@@ -1128,9 +1164,314 @@
       }
     },
     {
+      "id": "continuity_review",
+      "type": "llm",
+      "label": "自动检查连续性、计划与逻辑",
+      "inputs": {
+        "writing_context": {
+          "type": "string"
+        },
+        "content": {
+          "type": "string",
+          "maxLength": 100000
+        },
+        "historical_research": {
+          "type": "string",
+          "minLength": 200,
+          "maxLength": 12000,
+          "description": "本章写作前自动生成的历史研究档案；必须用于写作和成稿后的历史准确性核查。"
+        }
+      },
+      "outputs": {
+        "review": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "summary": {
+              "type": "string",
+              "maxLength": 2000
+            },
+            "issues": {
+              "type": "array",
+              "maxItems": 20,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "category": {
+                    "type": "string",
+                    "enum": [
+                      "continuity",
+                      "plan",
+                      "logic",
+                      "internal",
+                      "boundary",
+                      "historical"
+                    ]
+                  },
+                  "severity": {
+                    "type": "string",
+                    "enum": [
+                      "critical",
+                      "major",
+                      "minor"
+                    ]
+                  },
+                  "problem": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1200
+                  },
+                  "evidence_quote": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4000
+                  }
+                },
+                "required": [
+                  "category",
+                  "severity",
+                  "problem",
+                  "evidence_quote"
+                ]
+              }
+            }
+          },
+          "required": [
+            "summary",
+            "issues"
+          ]
+        }
+      },
+      "values": {},
+      "config": {
+        "mode": "json",
+        "provider": "",
+        "model": "",
+        "parameters": {},
+        "prompt_file": "write_chapter_continuity_review_prompt.md",
+        "preserve_prompt_whitespace": true,
+        "disable_format_review": true,
+        "review_evidence": "chapter_continuity_v1",
+        "private_output": true
+      }
+    },
+    {
+      "id": "needs_revision",
+      "type": "condition",
+      "label": "需要自动修正吗",
+      "inputs": {
+        "issues": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "category": {
+                "type": "string",
+                "enum": [
+                  "continuity",
+                  "plan",
+                  "logic",
+                  "internal",
+                  "boundary",
+                  "historical"
+                ]
+              },
+              "severity": {
+                "type": "string",
+                "enum": [
+                  "critical",
+                  "major",
+                  "minor"
+                ]
+              },
+              "problem": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1200
+              },
+              "evidence_quote": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 4000
+              }
+            },
+            "required": [
+              "category",
+              "severity",
+              "problem",
+              "evidence_quote"
+            ]
+          }
+        }
+      },
+      "outputs": {},
+      "values": {},
+      "config": {
+        "cases": [
+          {
+            "input": "issues",
+            "operator": "truthy",
+            "port": "yes"
+          }
+        ],
+        "else_port": "no"
+      }
+    },
+    {
+      "id": "auto_revise",
+      "type": "llm",
+      "label": "根据检查结果自动修正本章",
+      "inputs": {
+        "writing_context": {
+          "type": "string"
+        },
+        "content": {
+          "type": "string",
+          "maxLength": 100000
+        },
+        "review": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "summary": {
+              "type": "string",
+              "maxLength": 2000
+            },
+            "issues": {
+              "type": "array",
+              "maxItems": 20,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "category": {
+                    "type": "string",
+                    "enum": [
+                      "continuity",
+                      "plan",
+                      "logic",
+                      "internal",
+                      "boundary",
+                      "historical"
+                    ]
+                  },
+                  "severity": {
+                    "type": "string",
+                    "enum": [
+                      "critical",
+                      "major",
+                      "minor"
+                    ]
+                  },
+                  "problem": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1200
+                  },
+                  "evidence_quote": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4000
+                  }
+                },
+                "required": [
+                  "category",
+                  "severity",
+                  "problem",
+                  "evidence_quote"
+                ]
+              }
+            }
+          },
+          "required": [
+            "summary",
+            "issues"
+          ]
+        },
+        "historical_research": {
+          "type": "string",
+          "minLength": 200,
+          "maxLength": 12000,
+          "description": "本章写作前自动生成的历史研究档案；必须用于写作和成稿后的历史准确性核查。"
+        }
+      },
+      "outputs": {
+        "content": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100000
+        }
+      },
+      "values": {},
+      "config": {
+        "mode": "text",
+        "provider": "",
+        "model": "",
+        "parameters": {},
+        "prompt_file": "write_chapter_continuity_revise_prompt.md",
+        "output_port": "content"
+      }
+    },
+    {
+      "id": "keep_draft",
+      "type": "compose",
+      "label": "无问题，保留原稿",
+      "inputs": {
+        "content": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100000
+        }
+      },
+      "outputs": {
+        "content": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100000
+        }
+      },
+      "values": {},
+      "config": {
+        "fields": {
+          "content": "content"
+        }
+      }
+    },
+    {
+      "id": "final_content",
+      "type": "merge",
+      "label": "最终修订正文",
+      "inputs": {
+        "revised": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100000
+        },
+        "original": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100000
+        }
+      },
+      "outputs": {
+        "content": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100000
+        }
+      },
+      "values": {},
+      "config": {
+        "mode": "selected",
+        "output_port": "content"
+      }
+    },
+    {
       "id": "result",
       "type": "output",
-      "label": "审核候选",
+      "label": "自动检查修订后的章节",
       "inputs": {
         "content": {
           "maxLength": 100000,
@@ -1672,14 +2013,6 @@
       "source_path": []
     },
     {
-      "id": "generate-content-result-content",
-      "source": "generate",
-      "source_port": "content",
-      "target": "result",
-      "target_port": "content",
-      "source_path": []
-    },
-    {
       "id": "start-user_guidance-prepare-user_guidance",
       "source": "start",
       "source_port": "user_guidance",
@@ -1734,9 +2067,139 @@
       "target": "result",
       "target_port": "prepared_context",
       "source_path": []
+    },
+    {
+      "id": "generate-content-review-content",
+      "source": "generate",
+      "source_port": "content",
+      "target": "continuity_review",
+      "target_port": "content"
+    },
+    {
+      "id": "prepared-context-review-context",
+      "source": "prepared_data",
+      "source_port": "writing_context",
+      "target": "continuity_review",
+      "target_port": "writing_context"
+    },
+    {
+      "id": "review-issues-condition-issues",
+      "source": "continuity_review",
+      "source_port": "review",
+      "target": "needs_revision",
+      "target_port": "issues",
+      "source_path": [
+        "issues"
+      ]
+    },
+    {
+      "id": "generate-content-revise-content",
+      "source": "generate",
+      "source_port": "content",
+      "target": "auto_revise",
+      "target_port": "content"
+    },
+    {
+      "id": "review-output-revise-review",
+      "source": "continuity_review",
+      "source_port": "review",
+      "target": "auto_revise",
+      "target_port": "review"
+    },
+    {
+      "id": "prepared-context-revise-context",
+      "source": "prepared_data",
+      "source_port": "writing_context",
+      "target": "auto_revise",
+      "target_port": "writing_context"
+    },
+    {
+      "id": "generate-content-keep-original",
+      "source": "generate",
+      "source_port": "content",
+      "target": "keep_draft",
+      "target_port": "content"
+    },
+    {
+      "id": "auto-revise-final",
+      "source": "auto_revise",
+      "source_port": "content",
+      "target": "final_content",
+      "target_port": "revised"
+    },
+    {
+      "id": "keep-original-final",
+      "source": "keep_draft",
+      "source_port": "content",
+      "target": "final_content",
+      "target_port": "original"
+    },
+    {
+      "id": "final-content-result",
+      "source": "final_content",
+      "source_port": "content",
+      "target": "result",
+      "target_port": "content"
+    },
+    {
+      "id": "prepared-context-historical-research",
+      "source": "prepared_data",
+      "source_port": "writing_context",
+      "target": "historical_research",
+      "target_port": "writing_context",
+      "source_path": []
+    },
+    {
+      "id": "historical-research-generate",
+      "source": "historical_research",
+      "source_port": "historical_research",
+      "target": "generate",
+      "target_port": "historical_research",
+      "source_path": []
+    },
+    {
+      "id": "historical-research-review",
+      "source": "historical_research",
+      "source_port": "historical_research",
+      "target": "continuity_review",
+      "target_port": "historical_research",
+      "source_path": []
+    },
+    {
+      "id": "historical-research-revise",
+      "source": "historical_research",
+      "source_port": "historical_research",
+      "target": "auto_revise",
+      "target_port": "historical_research",
+      "source_path": []
     }
   ],
-  "control_edges": [],
+  "control_edges": [
+    {
+      "id": "condition-revise-yes",
+      "source": "needs_revision",
+      "source_port": "yes",
+      "target": "auto_revise"
+    },
+    {
+      "id": "condition-keep-no",
+      "source": "needs_revision",
+      "source_port": "no",
+      "target": "keep_draft"
+    },
+    {
+      "id": "revise-final-control",
+      "source": "auto_revise",
+      "source_port": "next",
+      "target": "final_content"
+    },
+    {
+      "id": "keep-final-control",
+      "source": "keep_draft",
+      "source_port": "next",
+      "target": "final_content"
+    }
+  ],
   "subflows": {},
   "editor": {
     "positions": {
@@ -1761,8 +2224,32 @@
         "y": 340
       },
       "result": {
-        "x": 360,
-        "y": 340
+        "x": 2130,
+        "y": 80
+      },
+      "continuity_review": {
+        "x": 1010,
+        "y": -160
+      },
+      "needs_revision": {
+        "x": 1290,
+        "y": -160
+      },
+      "auto_revise": {
+        "x": 1570,
+        "y": -260
+      },
+      "keep_draft": {
+        "x": 1570,
+        "y": -60
+      },
+      "final_content": {
+        "x": 1850,
+        "y": -160
+      },
+      "historical_research": {
+        "x": -320,
+        "y": 520
       }
     }
   },

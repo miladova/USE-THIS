@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import aclosing
 from copy import deepcopy
+from hashlib import sha256
 import json
 import logging
 from typing import Any
@@ -17,16 +18,19 @@ from starlette.types import Send
 
 from backend.api.error_protocol import DomainApiError, sse_error_payload, sse_event
 from backend.llm.config import get_llm_config
+from backend.llm.web_research import extract_verified_source_urls
 from backend.runtime import bind_log_context
 from backend.llm.schemas.writing_pydantic import WRITING_RESULTS, WRITING_TASKS, WRITING_SCOPE_FIELDS
 from backend.llm.schemas.volume_entity_pydantic import VOLUME_ENTITY_TASKS
 from backend.services.novel.errors import GenerationDomainError
 from backend.services.novel.plot_contract import PLOT_TASKS
+from backend.services.novel.writing_contract import CHAPTER_AUTO_REVIEW_MAX_REVISIONS
 from backend.services.novel.chapter_check_contract import (
     CHAPTER_CHECK_TASK, CHAPTER_CHECK_SCOPE_FIELDS, ChapterCheckInputV1,
     CHAPTER_ITEM_OWNER_CHECK_TASK, CHAPTER_ITEM_OWNER_FACTS_CHECK_TASK, CHAPTER_ITEM_OWNER_CHECK_SCOPE_FIELDS, ChapterItemOwnerCheckInputV1,
     CHAPTER_CHARACTER_RELATION_STATE_CHECK_TASK, CHAPTER_CHARACTER_RELATION_FACTS_CHECK_TASK, CHAPTER_CHARACTER_RELATION_STATE_CHECK_SCOPE_FIELDS, ChapterCharacterRelationStateCheckInputV1,
     CHAPTER_WORLD_RULES_CHECK_TASK, CHAPTER_WORLD_RULES_CHECK_SCOPE_FIELDS, ChapterWorldRulesCheckInputV1,
+    CHAPTER_CONTINUITY_CHECK_TASK, CHAPTER_CONTINUITY_CHECK_SCOPE_FIELDS, ChapterContinuityCheckInputV1,
 )
 from . import store as task_flow_store
 from .candidate import compute_flow_candidate_fingerprint, compute_preparation_fingerprint
@@ -113,6 +117,8 @@ def prepare_flow(task: str, request: GraphRunRequest, scope: dict[str, Any], *, 
         allowed_scope = CHAPTER_CHARACTER_RELATION_STATE_CHECK_SCOPE_FIELDS
     if task == CHAPTER_WORLD_RULES_CHECK_TASK:
         allowed_scope = CHAPTER_WORLD_RULES_CHECK_SCOPE_FIELDS
+    if task == CHAPTER_CONTINUITY_CHECK_TASK:
+        allowed_scope = CHAPTER_CONTINUITY_CHECK_SCOPE_FIELDS
     unknown_scope = set(run.scope) - allowed_scope
     if unknown_scope:
         raise DomainApiError("TASK_FLOW_SCOPE_INVALID", "操作位置包含未声明字段", field_errors={key: "不属于原页面的操作位置" for key in unknown_scope})
@@ -155,6 +161,15 @@ def prepare_flow(task: str, request: GraphRunRequest, scope: dict[str, Any], *, 
         except ValidationError as exc:
             raise DomainApiError("CHAPTER_WORLD_RULES_CHECK_INPUT_INVALID", "请选择有效章修订和一至五条不重复的世界规则及原版本", status_code=422,
                                  details={"errors": exc.errors(include_input=False, include_url=False)}) from exc
+    if task == CHAPTER_CONTINUITY_CHECK_TASK:
+        try:
+            run.scope = ChapterContinuityCheckInputV1.model_validate(run.scope).model_dump(mode="json")
+            run.scope["novel_id"] = run.scope["novel_id"].lower()
+            for field in ("chapter_id", "revision_id"):
+                run.scope["source"][field] = run.scope["source"][field].lower()
+        except ValidationError as exc:
+            raise DomainApiError("CHAPTER_CONTINUITY_CHECK_INPUT_INVALID", "请选择有效的章修订", status_code=422,
+                                 details={"errors": exc.errors(include_input=False, include_url=False)}) from exc
     if run.repair is not None and task not in REPAIRABLE_TASKS:
         raise DomainApiError("TASK_FLOW_REPAIR_UNSUPPORTED", "当前任务不支持响应修复")
     if (run.repair is not None and task == "create_volume_skeleton_by_ai"
@@ -173,6 +188,38 @@ def prepare_flow(task: str, request: GraphRunRequest, scope: dict[str, Any], *, 
         raise DomainApiError("TASK_FLOW_NOT_FOUND", "所选流程修订不存在", status_code=404) from exc
     if flow.task != task:
         raise DomainApiError("TASK_FLOW_TASK_MISMATCH", "所选方案不属于当前任务")
+    if task == "write_chapter_by_ai" and flow.id == "default_write_chapter_by_ai":
+        # Resolve a stale client reference to the latest immutable built-in default before migration.
+        try:
+            flow = store.get(flow.id)
+        except KeyError as exc:
+            raise DomainApiError("TASK_FLOW_NOT_FOUND", "默认写作流程不存在", status_code=404) from exc
+        try:
+            validate_task_definition(flow)
+        except FlowValidationError:
+            # Upgrade only the built-in default; a custom flow remains fail-closed until it includes QA.
+            from .defaults import builtin_flow
+            replacement = builtin_flow(task)
+            old_generator = next((node for node in flow.nodes if node.id == "generate" and node.type == "llm"), None)
+            if old_generator is not None:
+                nodes = []
+                for node in replacement.nodes:
+                    if node.id in {"generate", "historical_research", "continuity_review", "auto_revise"}:
+                        config = deepcopy(node.config)
+                        for key in ("provider", "model", "parameters"):
+                            if key in old_generator.config:
+                                config[key] = deepcopy(old_generator.config[key])
+                        node = node.model_copy(update={"config": config})
+                    nodes.append(node)
+                replacement = replacement.model_copy(update={"nodes": nodes})
+            replacement = replacement.model_copy(update={"default_provider": flow.default_provider or replacement.default_provider})
+            try:
+                replacement = store.save(replacement, expected_revision=flow.revision)
+                store.set_default(task, replacement.id, replacement.revision)
+            except Exception as exc:
+                raise DomainApiError("TASK_FLOW_MIGRATION_FAILED", "默认章节写作流程无法升级为强制历史研究与检查版，请刷新流程后重试", status_code=409) from exc
+            flow = replacement
+            run.flow_ref = FlowRef(id=flow.id, revision=flow.revision)
     try:
         model_config = get_llm_config()
     except (ValueError, RuntimeError) as exc:
@@ -378,6 +425,8 @@ async def task_flow_events(task: str, flow: Flow, run: GraphRunRequest, models: 
             loaded = await load_task_context(task, parameters, context_scope, run.generation_params)
             if task == CHAPTER_WORLD_RULES_CHECK_TASK and loaded.data["rules"] != initial.data["rules"]:
                 raise DomainApiError("CANDIDATE_SOURCE_CHANGED", "检查期间所选规则已变化，请重新读取后检查", status_code=409)
+            if task == CHAPTER_CONTINUITY_CHECK_TASK and loaded.data["continuity_context"] != initial.data["continuity_context"]:
+                raise DomainApiError("CANDIDATE_SOURCE_CHANGED", "检查期间本章计划、父级规划或前文已变化，请重新读取后检查", status_code=409)
             if node is review_context_node:
                 review_context = loaded
             if node is conflict_context_node:
@@ -430,13 +479,57 @@ async def task_flow_events(task: str, flow: Flow, run: GraphRunRequest, models: 
             return True
 
         def check_review_evidence(node: Node, inputs: dict[str, Any], outputs: dict[str, Any]) -> dict[str, Any]:
-            # 原文由上面的服务端检查填入；缓存中的核验状态每次都重新计算。
+            # 缓存中的核验状态每次都重新计算；章节自动审核只保留能在初稿找到原句的意见。
             review = outputs.get("review")
             if review is None:
                 return outputs
+            if node.config.get("review_evidence") == "chapter_continuity_v1":
+                content = inputs.get("content")
+                if not isinstance(content, str) or not isinstance(review, dict):
+                    raise FlowValidationError("自动连续性审核缺少原始章节正文或审核意见")
+                valid_issues = [issue for issue in review.get("issues", [])
+                                if isinstance(issue, dict) and isinstance(issue.get("evidence_quote"), str)
+                                and issue["evidence_quote"] and issue["evidence_quote"] in content]
+                if len(valid_issues) != len(review.get("issues", [])):
+                    logger.warning("[连续性审核忽略无原文依据意见] node=%s invalid=%s", node.id,
+                                   len(review.get("issues", [])) - len(valid_issues))
+                verified = {**review, "issues": valid_issues}
+                execution["chapter_automatic_review"] = deepcopy(verified)
+                execution["chapter_automatic_writing_context"] = content_context = inputs["writing_context"]
+                if not isinstance(content_context, str):
+                    raise FlowValidationError("自动连续性审核缺少本章写作上下文")
+                return {"review": verified}
+
             output = next(item for item in flow.nodes if item.type == "output")
             candidate_port = output.config["candidate_fields"][WRITING_TASKS[task][1]]
             return {"review": verify_review_evidence(review, inputs[candidate_port], inputs["review_material"]["sources"])}
+
+        async def execute_automatic_node(node: Node, inputs: dict[str, Any], instance: str) -> AsyncIterator[dict[str, Any]]:
+            """在同一写作请求内运行自动复核/修订节点，不暴露内部意见正文。
+
+            Args:
+                node: 已由任务流契约固定的复核或修订节点。
+                inputs: 当前章节和本章正式读取上下文。
+                instance: 本轮唯一执行路径。
+            Yields:
+                可见进度事件，以及仅供父流程消费的内部节点结果。
+            """
+            metadata = {"node_id": node.id, "instance_path": instance, "label": node.label}
+            yield {"event": "step", "data": {**metadata, "state": "running"}}
+            outputs = None
+            async with aclosing(models.execute(node, inputs, instance)) as model_events:
+                async for model_event in model_events:
+                    value = model_event.get("data", model_event)
+                    if value.get("status") == "done" or "outputs" in value:
+                        outputs = value.get("outputs")
+                    else:
+                        yield {"event": "progress", "data": {**metadata, **value, "state": "running"}}
+            if outputs is None:
+                raise FlowValidationError(f"{node.label or node.id} 没有返回完成结果")
+            if node.config.get("review_evidence"):
+                outputs = check_review_evidence(node, inputs, outputs)
+            yield {"event": "step", "data": {**metadata, "state": "done"}}
+            yield {"event": "_automatic_output", "data": outputs}
 
         async def organize(node: Node, inputs: dict[str, Any], instance: str) -> AsyncIterator[dict[str, Any]]:
             nonlocal prepared, continuation_used
@@ -496,6 +589,15 @@ async def task_flow_events(task: str, flow: Flow, run: GraphRunRequest, models: 
             async with aclosing(models.execute(node, inputs, instance)) as events:
                 async for event in events:
                     value = event.get("data", event)
+                    if node.id == "historical_research" and "outputs" in value:
+                        dossier = value["outputs"].get("historical_research")
+                        if (not isinstance(dossier, str) or len(dossier.strip()) < 200
+                                or len(extract_verified_source_urls(dossier)) < 3):
+                            raise FlowValidationError("写作前历史研究档案缺少足量联网核验来源或证据，不能继续写作")
+                        execution["chapter_historical_research"] = {
+                            "version": 1, "status": "completed", "report": dossier,
+                            "report_hash": sha256(dossier.encode("utf-8")).hexdigest(),
+                        }
                     if (node is review_node if review_node else node.id == review_node_id) and "outputs" in value:
                         execution["coverage_review"] = value["outputs"].get("review")
                     yield event
@@ -504,8 +606,11 @@ async def task_flow_events(task: str, flow: Flow, run: GraphRunRequest, models: 
             if run.repair is None:
                 trusted = [CachedNode.model_validate({key: value[key] for key in CachedNode.model_fields})
                            for value in resumed_nodes.values() if "input_fingerprint" in value]
+                # Per-chapter historical research must run afresh; a browser-supplied node cache cannot stand in for research.
+                cached_nodes = [item for item in run.cached_nodes
+                                if not (item.instance_path if isinstance(item, CachedNode) else item.get("instance_path", "")).endswith("/historical_research")]
                 async with aclosing(execute_flow(flow, run.flow_inputs, context=read_context, llm=generate, agent=organize,
-                                                cached_nodes=run.cached_nodes, resumed_nodes=trusted, execution_context=execution,
+                                                cached_nodes=cached_nodes, resumed_nodes=trusted, execution_context=execution,
                                                 candidate_check=check_candidate, review_evidence=check_review_evidence)) as events:
                     async for event in events:
                         yield event
@@ -569,18 +674,21 @@ async def task_flow_events(task: str, flow: Flow, run: GraphRunRequest, models: 
                     yield {"event": "done", "data": {"success": True, "result": deepcopy(flow_state.result)}}
                     return
                 update_agent_continuation(flow_token, size=flow_state.size())
-            if task in {CHAPTER_CHECK_TASK, CHAPTER_ITEM_OWNER_CHECK_TASK, CHAPTER_ITEM_OWNER_FACTS_CHECK_TASK, CHAPTER_CHARACTER_RELATION_STATE_CHECK_TASK, CHAPTER_CHARACTER_RELATION_FACTS_CHECK_TASK, CHAPTER_WORLD_RULES_CHECK_TASK}:
+            if task in {CHAPTER_CHECK_TASK, CHAPTER_ITEM_OWNER_CHECK_TASK, CHAPTER_ITEM_OWNER_FACTS_CHECK_TASK, CHAPTER_CHARACTER_RELATION_STATE_CHECK_TASK, CHAPTER_CHARACTER_RELATION_FACTS_CHECK_TASK, CHAPTER_WORLD_RULES_CHECK_TASK, CHAPTER_CONTINUITY_CHECK_TASK}:
                 # 删掉资料节点也不能跳过付费前核验，绑定只来自原请求。
                 initial = preflight or await load_task_context(task, {}, run.scope, run.generation_params)
                 if "fact_reads" in initial.data:
                     remember_fact_reads(initial.data["fact_reads"])
                     context_records.append(({}, deepcopy(run.scope), initial))
-                if task in {CHAPTER_ITEM_OWNER_CHECK_TASK, CHAPTER_ITEM_OWNER_FACTS_CHECK_TASK, CHAPTER_CHARACTER_RELATION_STATE_CHECK_TASK, CHAPTER_CHARACTER_RELATION_FACTS_CHECK_TASK, CHAPTER_WORLD_RULES_CHECK_TASK}:
+                if task in {CHAPTER_ITEM_OWNER_CHECK_TASK, CHAPTER_ITEM_OWNER_FACTS_CHECK_TASK, CHAPTER_CHARACTER_RELATION_STATE_CHECK_TASK, CHAPTER_CHARACTER_RELATION_FACTS_CHECK_TASK, CHAPTER_WORLD_RULES_CHECK_TASK, CHAPTER_CONTINUITY_CHECK_TASK}:
                     # 首次完整依据同时进入节点缓存签名，旧模型结果不能套上新人物版本。
                     execution["source_refs_by_node"]["preflight"] = [ref.model_dump(mode="json") for ref in initial.data["source_refs"]]
                 if task == CHAPTER_WORLD_RULES_CHECK_TASK:
                     # 完整快照也参与节点缓存签名，不用新规则快照包装旧模型结果。
                     execution["world_rules_check_rules"] = deepcopy(initial.data["rules"])
+                if task == CHAPTER_CONTINUITY_CHECK_TASK:
+                    # 连续性依据快照参与缓存签名，避免前文或计划变化后复用旧结果。
+                    execution["chapter_continuity_context"] = deepcopy(initial.data["continuity_context"])
             if task in VOLUME_ENTITY_TASKS:
                 parameters = {key: value for key, value in run.flow_inputs.items() if key in TASKS[task].request_model.model_fields and key not in SCOPE_FIELDS | GENERATION_FIELDS | TRANSPORT_FIELDS}
                 initial = preflight or await load_task_context(task, parameters, run.scope, run.generation_params)
@@ -598,6 +706,16 @@ async def task_flow_events(task: str, flow: Flow, run: GraphRunRequest, models: 
                 async for event in events:
                     if event["event"] != "done":
                         value = event["data"]
+                        if (event["event"] == "step" and value.get("node_id") == "historical_research"
+                                and value.get("state") == "done" and "outputs" in value):
+                            dossier = value["outputs"].get("historical_research")
+                            if (not isinstance(dossier, str) or len(dossier.strip()) < 200
+                                    or len(extract_verified_source_urls(dossier)) < 3):
+                                raise FlowValidationError("写作前历史研究档案缺少足量联网核验来源或证据，不能继续写作")
+                            execution["chapter_historical_research"] = {
+                                "version": 1, "status": "completed", "report": dossier,
+                                "report_hash": sha256(dossier.encode("utf-8")).hexdigest(),
+                            }
                         if event["event"] == "step" and value.get("state") == "done" and "outputs" in value and "input_fingerprint" in value:
                             instance = value["instance_path"]
                             completed_nodes[instance] = {**completed_nodes.get(instance, {}),
@@ -631,6 +749,77 @@ async def task_flow_events(task: str, flow: Flow, run: GraphRunRequest, models: 
                     if run.agent_continuation is not None and not continuation_used:
                         raise DomainApiError("AGENT_CONTINUATION_NODE_MISSING", "本次流程没有到达原资料整理节点，请重新整理", status_code=409)
                     final = event["data"]["result"]
+                    chapter_revision_count = 0
+                    if task == "write_chapter_by_ai":
+                        research_record = execution.get("chapter_historical_research")
+                        if (not isinstance(research_record, dict) or research_record.get("version") != 1
+                                or research_record.get("status") != "completed"
+                                or not isinstance(research_record.get("report"), str)
+                                or sha256(research_record["report"].encode("utf-8")).hexdigest() != research_record.get("report_hash")):
+                            raise DomainApiError("CHAPTER_HISTORICAL_RESEARCH_REQUIRED", "本章缺少完整的写作前历史研究，不能返回候选", status_code=502)
+                        historical_research = research_record["report"]
+                    if task == "write_chapter_by_ai" and execution.get("chapter_automatic_review", {}).get("issues"):
+                        # The graph performs the first historical/continuity review and correction. Recheck every
+                        # corrected draft until both are clear, or fail closed after the shared revision budget.
+                        review_node = next(node for node in flow.nodes if node.config.get("review_evidence") == "chapter_continuity_v1")
+                        revision_node = next(node for node in flow.nodes if node.id == "auto_revise")
+                        writing_context = execution.get("chapter_automatic_writing_context")
+                        content_field = WRITING_TASKS[task][1]
+                        current_content = final["candidate"][content_field]
+                        # The static graph already applied correction pass one.
+                        revisions = 1
+                        while True:
+                            review_inputs = {"writing_context": writing_context, "content": current_content,
+                                             "historical_research": historical_research}
+                            review_outputs = None
+                            review_instance = f"{flow.id}/automatic_review_{revisions + 1}"
+                            async for automatic_event in execute_automatic_node(review_node, review_inputs, review_instance):
+                                if automatic_event["event"] == "_automatic_output":
+                                    review_outputs = automatic_event["data"]
+                                else:
+                                    yield automatic_event
+                            review_result = (review_outputs or {}).get("review")
+                            if not isinstance(review_result, dict) or not isinstance(review_result.get("issues"), list):
+                                raise FlowValidationError("自动连续性复核没有返回有效的审核结果")
+                            if not review_result["issues"]:
+                                break
+                            if revisions >= CHAPTER_AUTO_REVIEW_MAX_REVISIONS:
+                                raise DomainApiError(
+                                    "CHAPTER_AUTO_REVIEW_UNRESOLVED",
+                                    "自动历史真实性与连续性检查在多轮修正后仍发现疑点；为避免交付已知未解决的章节，请重新生成",
+                                    status_code=502,
+                                    details={"maximum_automatic_revisions": CHAPTER_AUTO_REVIEW_MAX_REVISIONS},
+                                )
+                            revision_inputs = {"writing_context": writing_context, "content": current_content,
+                                               "review": review_result, "historical_research": historical_research}
+                            revision_outputs = None
+                            revision_instance = f"{flow.id}/automatic_revision_{revisions + 1}"
+                            async for automatic_event in execute_automatic_node(revision_node, revision_inputs, revision_instance):
+                                if automatic_event["event"] == "_automatic_output":
+                                    revision_outputs = automatic_event["data"]
+                                else:
+                                    yield automatic_event
+                            revised_content = (revision_outputs or {}).get("content")
+                            if not isinstance(revised_content, str) or not revised_content.strip():
+                                raise FlowValidationError("自动连续性修正没有返回完整章节正文")
+                            current_content = revised_content
+                            revisions += 1
+                        final["candidate"][content_field] = current_content
+                        chapter_revision_count = revisions
+                    if task == "write_chapter_by_ai":
+                        final_review = execution.get("chapter_automatic_review")
+                        if not isinstance(final_review, dict) or final_review.get("issues"):
+                            raise DomainApiError("CHAPTER_AUTO_REVIEW_REQUIRED", "章节未通过自动历史真实性与连续性检查，不能返回候选", status_code=502)
+                        final_content = final["candidate"].get("content")
+                        if not isinstance(final_content, str) or not final_content.strip():
+                            raise DomainApiError("CHAPTER_AUTO_REVIEW_REQUIRED", "自动检查没有对应的完整最终正文", status_code=502)
+                        execution["chapter_quality_gate"] = {
+                            "version": 2, "status": "passed", "revision_count": chapter_revision_count,
+                            "maximum_revisions": CHAPTER_AUTO_REVIEW_MAX_REVISIONS,
+                            "final_content_hash": sha256(final_content.encode("utf-8")).hexdigest(),
+                            "historical_research_hash": research_record["report_hash"],
+                            "historical_reviewed": True,
+                        }
                     context = None
                     if task != "create_novel_by_ai":
                         final_parameters, final_scope = prepared_task_parameters(task, final["business_inputs"], run.scope, prepared)
@@ -643,6 +832,8 @@ async def task_flow_events(task: str, flow: Flow, run: GraphRunRequest, models: 
                         business_input["use_stream"] = run.use_stream
                     if task == CHAPTER_WORLD_RULES_CHECK_TASK and context.data["rules"] != initial.data["rules"]:
                         raise DomainApiError("CANDIDATE_SOURCE_CHANGED", "检查期间所选规则已变化，请重新读取后检查", status_code=409)
+                    if task == CHAPTER_CONTINUITY_CHECK_TASK and context.data["continuity_context"] != initial.data["continuity_context"]:
+                        raise DomainApiError("CANDIDATE_SOURCE_CHANGED", "检查期间本章计划、父级规划或前文已变化，请重新读取后检查", status_code=409)
                     if task == CHAPTER_CHARACTER_RELATION_FACTS_CHECK_TASK and context.data["fact_reads"] != initial.data["fact_reads"]:
                         # 来源短暂改变后恢复，也不能把末端新读到的事实贴到原检查依据上。
                         raise DomainApiError("CHARACTER_RELATION_FACT_CONTEXT_CHANGED", "检查期间章前关系事实已变化，请保留草稿并重新检查", status_code=409)
@@ -661,8 +852,8 @@ async def task_flow_events(task: str, flow: Flow, run: GraphRunRequest, models: 
                         final_versions = {(ref["resource_type"], ref["id"]): ref["version"] for ref in source_values}
                         if run.repair is not None and final_versions != {(ref.resource_type, ref.id): ref.version for ref in run.repair.source_refs}:
                             raise DomainApiError("CANDIDATE_SOURCE_CHANGED", "修复期间资料已修改，请重新生成", status_code=409)
-                        for sources in ([] if prepared is not None and task not in {CHAPTER_ITEM_OWNER_CHECK_TASK, CHAPTER_ITEM_OWNER_FACTS_CHECK_TASK, CHAPTER_CHARACTER_RELATION_STATE_CHECK_TASK, CHAPTER_CHARACTER_RELATION_FACTS_CHECK_TASK, CHAPTER_WORLD_RULES_CHECK_TASK} else execution["source_refs_by_node"].values()):
-                            if (task in VOLUME_ENTITY_TASKS or task in {CHAPTER_ITEM_OWNER_CHECK_TASK, CHAPTER_ITEM_OWNER_FACTS_CHECK_TASK, CHAPTER_CHARACTER_RELATION_STATE_CHECK_TASK, CHAPTER_CHARACTER_RELATION_FACTS_CHECK_TASK, CHAPTER_WORLD_RULES_CHECK_TASK}) and final_versions != {(source["resource_type"], source["id"]): source["version"] for source in sources}:
+                        for sources in ([] if prepared is not None and task not in {CHAPTER_ITEM_OWNER_CHECK_TASK, CHAPTER_ITEM_OWNER_FACTS_CHECK_TASK, CHAPTER_CHARACTER_RELATION_STATE_CHECK_TASK, CHAPTER_CHARACTER_RELATION_FACTS_CHECK_TASK, CHAPTER_WORLD_RULES_CHECK_TASK, CHAPTER_CONTINUITY_CHECK_TASK} else execution["source_refs_by_node"].values()):
+                            if (task in VOLUME_ENTITY_TASKS or task in {CHAPTER_ITEM_OWNER_CHECK_TASK, CHAPTER_ITEM_OWNER_FACTS_CHECK_TASK, CHAPTER_CHARACTER_RELATION_STATE_CHECK_TASK, CHAPTER_CHARACTER_RELATION_FACTS_CHECK_TASK, CHAPTER_WORLD_RULES_CHECK_TASK, CHAPTER_CONTINUITY_CHECK_TASK}) and final_versions != {(source["resource_type"], source["id"]): source["version"] for source in sources}:
                                 raise DomainApiError("CANDIDATE_SOURCE_CHANGED", "生成期间档案或卷状态已新增、删除或修改，请重新生成", status_code=409)
                             for source in sources:
                                 identity = (source["resource_type"], source["id"])
@@ -687,6 +878,9 @@ async def task_flow_events(task: str, flow: Flow, run: GraphRunRequest, models: 
                             final["candidate"]["source_conflicts"] = None
                             execution.pop("plot_source_conflict_inputs", None)
                             execution.pop("plot_source_conflicts_v1", None)
+                    # Do not expose the private critic notes or full prompt context in the returned candidate basis.
+                    execution.pop("chapter_automatic_review", None)
+                    execution.pop("chapter_automatic_writing_context", None)
                     snapshot = {
                         "flow_ref": run.flow_ref.model_dump(mode="json"),
                         "definition_hash": flow_fingerprint(flow),
@@ -794,7 +988,7 @@ async def generate_task_flow(task: str, request: GraphRunRequest, *, scope: dict
             run.flow_inputs["independent_faction_count"] = 1
             parameters["independent_faction_count"] = 1
         preflight = await load_task_context(task, parameters, run.scope, run.generation_params)
-    if task in {CHAPTER_CHECK_TASK, CHAPTER_ITEM_OWNER_CHECK_TASK, CHAPTER_ITEM_OWNER_FACTS_CHECK_TASK, CHAPTER_CHARACTER_RELATION_STATE_CHECK_TASK, CHAPTER_CHARACTER_RELATION_FACTS_CHECK_TASK, CHAPTER_WORLD_RULES_CHECK_TASK}:
+    if task in {CHAPTER_CHECK_TASK, CHAPTER_ITEM_OWNER_CHECK_TASK, CHAPTER_ITEM_OWNER_FACTS_CHECK_TASK, CHAPTER_CHARACTER_RELATION_STATE_CHECK_TASK, CHAPTER_CHARACTER_RELATION_FACTS_CHECK_TASK, CHAPTER_WORLD_RULES_CHECK_TASK, CHAPTER_CONTINUITY_CHECK_TASK}:
         preflight = await load_task_context(task, {}, run.scope, run.generation_params)
     if task in VOLUME_ENTITY_TASKS:
         parameters = {key: value for key, value in run.flow_inputs.items() if key in TASKS[task].request_model.model_fields and key not in SCOPE_FIELDS | GENERATION_FIELDS | TRANSPORT_FIELDS}

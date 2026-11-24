@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from hashlib import sha256
+
 from pymongo.asynchronous.client_session import AsyncClientSession
 
 from typing import Any
@@ -16,7 +18,8 @@ from backend.db.utils import get_utc_now
 from backend.db.write_contracts import build_idempotency_fingerprint, canonical_request_hash
 from backend.llm.schemas.writing_pydantic import WRITING_RESULTS, WRITING_TASKS, WritingGenerateInputV1
 from backend.services.novel.writing_context import load_writing_context, load_writing_parents, protect_writing_sources
-from backend.services.novel.writing_contract import WritingConfirmV1, WritingContextBasisV1
+from backend.llm.web_research import extract_verified_source_urls
+from backend.services.novel.writing_contract import WritingConfirmV1, WritingContextBasisV1, CHAPTER_AUTO_REVIEW_MAX_REVISIONS
 
 
 def merge_writing_reads(contexts: list[dict[str, Any]]) -> dict[str, Any]:
@@ -195,6 +198,28 @@ async def confirm_writing(task: str, parent_id: str, request: WritingConfirmV1, 
             snapshot = basis.flow_snapshot
             if snapshot is None or snapshot.get("scope", {}).get("target_id") != inputs.target_id:
                 raise DomainApiError("WRITING_CANDIDATE_MISMATCH", "候选缺少原图及操作位置", status_code=409)
+            if task == "write_chapter_by_ai":
+                execution = snapshot.get("execution", {})
+                gate = execution.get("chapter_quality_gate")
+                research = execution.get("chapter_historical_research")
+                content = request.candidate.get("content") if isinstance(request.candidate, dict) else None
+                content_hash = sha256(content.encode("utf-8")).hexdigest() if isinstance(content, str) else None
+                research_report = research.get("report") if isinstance(research, dict) else None
+                research_hash = sha256(research_report.encode("utf-8")).hexdigest() if isinstance(research_report, str) else None
+                if (not isinstance(gate, dict) or gate.get("version") != 2 or gate.get("status") != "passed"
+                        or type(gate.get("revision_count")) is not int
+                        or not 0 <= gate["revision_count"] <= CHAPTER_AUTO_REVIEW_MAX_REVISIONS
+                        or gate.get("maximum_revisions") != CHAPTER_AUTO_REVIEW_MAX_REVISIONS
+                        or not isinstance(research, dict) or research.get("version") != 1 or research.get("status") != "completed"
+                        or not research_hash or research_hash != research.get("report_hash")
+                        or len(extract_verified_source_urls(research_report)) < 3
+                        or gate.get("historical_research_hash") != research_hash or gate.get("historical_reviewed") is not True
+                        or not content_hash or gate.get("final_content_hash") != content_hash):
+                    raise DomainApiError(
+                        "CHAPTER_AUTO_REVIEW_REQUIRED",
+                        "章节正文必须先通过自动历史真实性与连续性检查；正文有改动或检查依据缺失时，请重新生成",
+                        status_code=409,
+                    )
             timing.phase("来源复查（含Agent保护）")
             data = await load_writing_context(task, {}, inputs.model_dump(mode="json"), session=session, parent_chain=parent_chain)
             contexts = [data]

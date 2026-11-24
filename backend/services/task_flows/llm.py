@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import json
 from collections.abc import AsyncIterator, Awaitable, Callable
+from urllib.parse import urlsplit
 from contextlib import aclosing
 from time import perf_counter
 from typing import Any
@@ -19,8 +20,9 @@ from backend.llm.logger import log_parse_error
 from backend.runtime import bind_log_context
 from backend.llm.factory import create_llm_client_from_config
 from backend.llm.models import LLMRequest, TokenUsage
+from backend.llm.web_research import build_verified_source_appendix
 from backend.services.llm.format_review_service import FORMAT_REVIEW_PROMPT_TEMPLATE, resolve_format_review_provider
-from backend.services.novel.chapter_check_contract import CHAPTER_WORLD_RULES_CHECK_TASK
+from backend.services.novel.chapter_check_contract import CHAPTER_WORLD_RULES_CHECK_TASK, CHAPTER_CONTINUITY_CHECK_TASK
 from .contracts import Flow, Node
 from .agent_continuation import FlowContinuationState, update_agent_continuation
 from .engine import render_template
@@ -97,6 +99,7 @@ class FlowModels:
         self.recovery_token: str | None = None
         self.defaults: dict[int, str] = {}
         self.output_models: dict[int, type[BaseModel]] = {}
+        self.web_search_provider_configs: dict[int, tuple[str, Any]] = {}
         pending = [] if repairing else [flow]
         while pending:
             graph = pending.pop()
@@ -106,10 +109,18 @@ class FlowModels:
                     continue
                 self.defaults[id(node)] = graph.default_provider or config.default_provider
                 provider = node.config.get("provider") or graph.default_provider or config.default_provider
-                if not node.config.get("provider_input"):
+                if node.config.get("web_search_required"):
+                    provider, research_config = self._select_web_search_provider(
+                        node.config.get("provider"), graph.default_provider or config.default_provider,
+                    )
+                    self.web_search_provider_configs[id(node)] = (provider, research_config)
+                    provider_config = research_config
+                elif not node.config.get("provider_input"):
                     provider_config = self._provider(provider)
-                    if node.type == "agent" and not provider_config.supports_function_calling:
-                        raise DomainApiError("AGENT_PROVIDER_UNSUPPORTED", f"节点 {node.label or node.id} 的模型服务不支持 Function Calling，请修改模型设置", status_code=422)
+                else:
+                    provider_config = None
+                if node.type == "agent" and provider_config is not None and not provider_config.supports_function_calling:
+                    raise DomainApiError("AGENT_PROVIDER_UNSUPPORTED", f"节点 {node.label or node.id} 的模型服务不支持 Function Calling，请修改模型设置", status_code=422)
                 options = {**self.parameters, **node.config.get("parameters", {})}
                 if node.config.get("system_prompt") is not None:
                     options["system_prompt"] = node.config["system_prompt"]
@@ -124,6 +135,48 @@ class FlowModels:
             "providers": {name: value.model_dump(exclude={"api_key", "base_url", "use_system_proxy"})
                           for name, value in self.config.providers.items()},
         }
+
+    def _select_web_search_provider(self, explicit: str | None, preferred: str) -> tuple[str, Any]:
+        """Select only a configured official provider with native, citation-bearing web search.
+
+        Args:
+            explicit: Optional provider pinned on the research node.
+            preferred: Current task/default provider name.
+        Returns:
+            Provider alias and a config resolved for the native search API.
+        Raises:
+            DomainApiError: No live search-capable provider is available.
+        """
+        names = [explicit] if explicit else [preferred, self.config.default_provider, *self.config.providers.keys()]
+        seen: set[str] = set()
+        for name in names:
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            base = self.config.providers.get(name)
+            if base is None or not base.enabled or not base.api_key:
+                continue
+            host = urlsplit(base.base_url).hostname if base.base_url else None
+            if base.type == "openai":
+                official = not host or host == "api.openai.com"
+                try:
+                    supported = official and base.resolved_api_mode == "responses"
+                except ValueError:
+                    supported = False
+                if supported:
+                    return name, base
+            elif base.type == "gemini":
+                official = not host or host == "generativelanguage.googleapis.com"
+                if official and base.api_mode in {"auto", "generate_content"}:
+                    # Google Search grounding is available through the official Generate Content API.
+                    return name, base.model_copy(update={"api_mode": "generate_content"})
+            if explicit:
+                break
+        raise DomainApiError(
+            "HISTORICAL_RESEARCH_PROVIDER_REQUIRED",
+            "必须配置已启用且带 API 密钥的官方 OpenAI Responses 或 Gemini Generate Content 服务，才能进行联网历史研究；未完成联网研究时不会写作或交付章节",
+            status_code=503,
+        )
 
     def _provider(self, name: str):
         value = self.config.providers.get(name)
@@ -141,6 +194,9 @@ class FlowModels:
             服务名和已经验证可用的配置。
         """
         cfg = node.config
+        if cfg.get("web_search_required") and id(node) in self.web_search_provider_configs:
+            name, config = self.web_search_provider_configs[id(node)]
+            return name, config
         name = (inputs.get(cfg["provider_input"]) if cfg.get("provider_input") else None) or cfg.get("provider") or self.defaults.get(id(node)) or self.config.default_provider
         return name, self._provider(name)
 
@@ -218,6 +274,9 @@ class FlowModels:
             supports_streaming=config.supports_streaming,
             supports_json_schema=config.supports_json_schema and config.resolved_structured_output_mode != "json_object",
         )
+        if cfg.get("web_search_required"):
+            request = request.model_copy(update={"stream": False})
+            stream, native = False, False
         checkpoint = self.recovery_state.model_call if self.recovery_state is not None else None
         if checkpoint is not None:
             fingerprint = canonical_hash({"request": request.model_dump(mode="json"), "provider": provider,
@@ -237,6 +296,19 @@ class FlowModels:
             raw = checkpoint["raw"]
             usage = TokenUsage.model_validate(checkpoint["usage"])
             usage_complete = checkpoint["usage_complete"]
+        elif cfg.get("web_search_required"):
+            search_call = getattr(client, "web_search_text", None)
+            if search_call is None:
+                raise DomainApiError("HISTORICAL_RESEARCH_PROVIDER_REQUIRED", "所选模型服务不提供可验证的联网搜索", status_code=503)
+            yield {"status": "progress", "message": "正在检索历史资料并核对来源", "provider": provider, "model": request.model or config.default_model}
+            response = await search_call(request)
+            sources = (response.raw_response or {}).get("web_sources", [])
+            appendix = build_verified_source_appendix(sources, minimum_sources=3)
+            raw = f"{response.content.strip()}\n{appendix}".strip()
+            if len(raw) > 12000:
+                raise DomainApiError("HISTORICAL_RESEARCH_REPORT_TOO_LONG", "联网历史研究报告和来源证据超过限制；为保持证据完整，本章已停止生成", status_code=502)
+            usage = response.usage
+            usage_complete = usage.total_tokens > 0
         elif stream:
             chunks = []
             characters = 0
@@ -277,12 +349,12 @@ class FlowModels:
         try:
             result = schema.model_validate_json(raw)
         except (ValidationError, ValueError) as exc:
-            log_parse_error(exc, content=raw, schema=schema, message="节点输出校验失败" if native or self.task == CHAPTER_WORLD_RULES_CHECK_TASK else "节点输出校验失败，准备格式审校")
+            log_parse_error(exc, content=raw, schema=schema, message="节点输出校验失败" if native or cfg.get("disable_format_review") or self.task in {CHAPTER_WORLD_RULES_CHECK_TASK, CHAPTER_CONTINUITY_CHECK_TASK} else "节点输出校验失败，准备格式审校")
             if native:
                 raise LLMSchemaError("Provider 原生结构化结果不符合节点输出") from exc
-            if self.task == CHAPTER_WORLD_RULES_CHECK_TASK:
-                # 缺失或非法的疑点不能由另一次模型调用补成“没有疑点”。
-                raise LLMSchemaError("世界规则检查结果格式不正确，请重新检查") from exc
+            if cfg.get("disable_format_review") or self.task in {CHAPTER_WORLD_RULES_CHECK_TASK, CHAPTER_CONTINUITY_CHECK_TASK}:
+                # 缺失或非法的检查结果不能由另一次模型调用补成“没有疑点”。
+                raise LLMSchemaError("自动连续性审核或修正结果格式不正确，请重新生成章节") from exc
             # 沿用一次格式审校，使用请求开始时的配置，取消与错误直接向外传播。
             reviewer_name = resolve_format_review_provider(self.config)
             logger.info("[格式审校开始] provider=%s", reviewer_name)
