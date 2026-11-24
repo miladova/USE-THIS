@@ -389,7 +389,7 @@ function GenerationEditor({ node, choices, choicesError, fixedSetup, planOrigin,
           </details>}
           {loading ? <p role="status">{t("loading")}</p> : !preview ? <>
             {!inPage && <TaskFlowForm flow={flow} disabled={Boolean(requiredSetup) || !restored} showError={error !== flow.error} />}
-          </> : node.kind === "chapter" ? <label className="grid gap-3 text-sm">{t("bodyCandidate")}<textarea value={preview.candidate.content} disabled={candidateLocked} onChange={(e) => { if (!candidateLocked) setPreview({ ...preview, candidate: { content: e.target.value } }); }} className={`${PLANNING_INPUT} min-h-[50vh] resize-y text-[15px] leading-[1.85]`} /></label> : <>
+          </> : node.kind === "chapter" ? <label className="grid gap-3 text-sm">{t("bodyCandidate")}<textarea value={preview.candidate.content} readOnly disabled={candidateLocked} className={`${PLANNING_INPUT} min-h-[50vh] resize-y text-[15px] leading-[1.85]`} /></label> : <>
             <div className="mb-5 flex flex-wrap items-end gap-3 border-b border-border pb-4">
               <label className="grid min-w-0 flex-1 gap-2 text-xs font-medium text-muted">{t("candidates", { count: candidates.length })}<select ref={candidateSelect} className={PLANNING_INPUT} value={selected} disabled={saving} onChange={(e) => setSelected(Number(e.target.value))}>{candidates.map((item, index) => <option key={index} value={index}>{index + 1}. {item.title}</option>)}</select></label>
               <Button size="sm" variant="ghost" isDisabled={candidateLocked || candidates.length < 2} onPress={() => {

@@ -448,8 +448,18 @@ def validate_flow(flow: Flow | dict[str, Any], *, _depth: int = 0) -> Flow:
             if node.type != "llm" or node.config.get("mode", "json") != "json" or _depth:
                 raise FlowValidationError(f"{label} 的双来源报告只能用于主流程的 JSON 模型节点")
         if "review_evidence" in node.config:
-            if node.config["review_evidence"] != "writing_review_v1" or node.config.get("candidate_check") != "writing_planning_v1":
-                raise FlowValidationError(f"{label} 的审核原句契约不存在或缺少候选检查")
+            if node.config["review_evidence"] == "writing_review_v1":
+                if node.config.get("candidate_check") != "writing_planning_v1":
+                    raise FlowValidationError(f"{label} 的审核原句契约不存在或缺少候选检查")
+            elif (node.config["review_evidence"] != "chapter_continuity_v1" or flow.task != "write_chapter_by_ai"
+                  or node.type != "llm" or node.config.get("mode", "json") != "json" or _depth):
+                raise FlowValidationError(f"{label} 的自动章节审核原句契约无效")
+        if node.config.get("private_output") and not (
+            node.config.get("review_evidence") == "chapter_continuity_v1"
+            or (flow.task == "write_chapter_by_ai" and node.id == "historical_research"
+                and node.type == "llm" and node.config.get("mode", "json") == "text" and not _depth)
+        ):
+            raise FlowValidationError(f"{label} 只能在内部自动审核或历史研究节点中隐藏模型结果")
         if "candidate_check" in node.config:
             if node.config["candidate_check"] != "writing_planning_v1":
                 raise FlowValidationError(f"{label} 的候选检查契约不存在")

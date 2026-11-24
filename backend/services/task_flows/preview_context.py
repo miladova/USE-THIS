@@ -43,7 +43,7 @@ from backend.services.llm.volume_planning_generation_service import _volume_prom
 from backend.services.llm.world_rule_generation_service import WorldRuleGenerationService
 from backend.services.novel.world_rule_service import WorldRuleService
 from backend.services.novel.plot_contract import PLOT_TASKS
-from backend.services.novel.chapter_check_contract import CHAPTER_CHECK_TASK, CHAPTER_ITEM_OWNER_CHECK_TASK, CHAPTER_ITEM_OWNER_FACTS_CHECK_TASK, CHAPTER_CHARACTER_RELATION_STATE_CHECK_TASK, CHAPTER_CHARACTER_RELATION_FACTS_CHECK_TASK, CHAPTER_WORLD_RULES_CHECK_TASK
+from backend.services.novel.chapter_check_contract import CHAPTER_CHECK_TASK, CHAPTER_ITEM_OWNER_CHECK_TASK, CHAPTER_ITEM_OWNER_FACTS_CHECK_TASK, CHAPTER_CHARACTER_RELATION_STATE_CHECK_TASK, CHAPTER_CHARACTER_RELATION_FACTS_CHECK_TASK, CHAPTER_WORLD_RULES_CHECK_TASK, CHAPTER_CONTINUITY_CHECK_TASK
 from backend.services.novel.plot_service import load_plot_context, plot_prompt_context
 from backend.services.novel.writing_context import (
     NOVEL_FIELDS, load_writing_context, load_writing_parents, volume_missing_fields, position_content, chapter_scope_content,
@@ -139,6 +139,9 @@ async def load_preview_context(task: str, parameters: dict[str, Any], scope: dic
         return _finish(task, {}, [], missing, {})
     if task == CHAPTER_WORLD_RULES_CHECK_TASK:
         missing = [{"port": name, "path": [], "note": "请在章后报告中选择章修订和一至五条全书活动规则"} for name in context.outputs]
+        return _finish(task, {}, [], missing, {})
+    if task == CHAPTER_CONTINUITY_CHECK_TASK:
+        missing = [{"port": name, "path": [], "note": "将在章后检查中读取已保存章节、计划和已确认设定"} for name in context.outputs]
         return _finish(task, {}, [], missing, {})
     start = next(node for node in flow.nodes if node.type == "input")
     params = {**{name: schema["default"] for name, schema in start.outputs.items() if "default" in schema}, **parameters}

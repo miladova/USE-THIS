@@ -179,6 +179,12 @@ class ChapterService:
         prepared = []
         for data, idempotency_key in chapters:
             fields = (data if isinstance(data, ChapterCreateV2) else ChapterCreateV2.model_validate(data)).model_dump()
+            if fields["content"].strip():
+                raise DomainApiError(
+                    "CHAPTER_AUTO_REVIEW_REQUIRED",
+                    "新章节正文必须通过自动连续性检查的 AI 写作流程生成",
+                    status_code=409,
+                )
             prepared.append((fields, build_idempotency_fingerprint(idempotency_key, {"scene_id": scene_id, **fields})))
         novel, volume, arc, scene = await load_chapter_parent_chain(scene_id, session=session)
         existing = await chapter_repo.collection.find({
@@ -316,6 +322,13 @@ class ChapterService:
         chapter = await ChapterService.get_chapter(chapter_id, session=session)
         if chapter["version"] != request.expected_version:
             raise VersionConflictError("章节已被修改，请保留草稿并刷新后比较")
+        if ("content" in fields and fields["content"] != chapter["content"]
+                and source != "writing"):
+            raise DomainApiError(
+                "CHAPTER_AUTO_REVIEW_REQUIRED",
+                "章节正文只能通过已完成自动连续性检查的写作流程更新",
+                status_code=409,
+            )
         if restored_from_version is None and all(chapter[key] == value for key, value in fields.items()):
             return chapter
         previous = await BaseRepository("chapter_revisions").collection.find_one({"chapter_id": chapter["_id"]}, sort=[("version", -1)], session=session)

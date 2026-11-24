@@ -13,14 +13,19 @@ from backend.services.novel.chapter_check_contract import (
     ChapterItemOwnerCheckInputV1, ChapterItemOwnerCheckResultV1,
     ChapterCharacterRelationStateCheckInputV1, ChapterCharacterRelationStateCheckResultV1,
     ChapterWorldRulesCheckInputV1, ChapterWorldRulesCheckResultV1,
+    ChapterContinuityCheckInputV1, ChapterContinuityCheckResultV1,
 )
 from backend.services.llm.candidate_contract import CandidateSourceRefV1
 from backend.services.novel.writing_context import load_writing_parents
+from backend.services.novel.writing_position import writing_order
 from backend.services.novel.character_fact_service import read_character_facts
 from backend.services.novel.character_relation_fact_service import read_character_relation_facts
 
 
 CHAPTER_CHECK_RULES_MAX_CHARACTERS = 60000
+CHAPTER_CONTINUITY_CONTEXT_MAX_CHARACTERS = 60000
+CHAPTER_CONTINUITY_PREVIOUS_LIMIT = 2
+CHAPTER_CONTINUITY_EXCERPT_CHARACTERS = 6000
 
 
 async def _load_chapter_check_source(novel_id: str, source: ChapterCheckSourceV1, *, session) -> tuple[dict, str]:
@@ -481,6 +486,219 @@ def validate_chapter_world_rules_check_result(candidate: dict, data: dict) -> di
     for issue in result.issues:
         if not set(issue.rule_ids).issubset(selected):
             raise DomainApiError("CHAPTER_CHECK_RULE_NOT_SELECTED", "疑点引用了未选择的世界规则，请重新检查", status_code=422)
+        if content[issue.start:issue.start + len(issue.quote)] != issue.quote:
+            raise DomainApiError("CHAPTER_CHECK_QUOTE_MISMATCH", "疑点的原文片段与所选修订的位置不一致，请重新检查", status_code=422)
+    return result.model_dump(mode="json")
+
+
+def _continuity_parent_fields(kind: str) -> tuple[str, ...]:
+    """返回连续性检查读取的父级白名单字段，不开放任意文档路径。
+
+    Args:
+        kind: 小说、卷、篇章或场景。
+    Returns:
+        允许进入模型的字段路径；点号表示嵌套 planning 字段。
+    """
+    if kind == "novel":
+        return ("title", "plot", "worldview", "core_seed", "core_idea", "summary",
+                "genre", "tone", "writing_style", "narrative_pov", "era_background")
+    if kind == "volume":
+        return ("title", "plot", "summary", "planning.premise", "planning.major_conflict",
+                "planning.start_state", "planning.end_state")
+    return ("title", "plot", "summary", "planning.goal", "planning.start_state",
+            "planning.end_state", "planning.continuity_notes")
+
+
+def _continuity_extract(document: dict, fields: tuple[str, ...]) -> dict:
+    """按白名单提取父级字段，缺失字段不补造。
+
+    Args:
+        document: 父级正式文档。
+        fields: 点号路径白名单。
+    Returns:
+        仅含实际存在字段的公开资料。
+    """
+    result: dict = {}
+    for path in fields:
+        value: object = document
+        for key in path.split("."):
+            value = value.get(key) if isinstance(value, dict) else None
+            if value is None:
+                break
+        if value is not None:
+            result[path] = value
+    return result
+
+
+def _continuity_plan_summary(document: dict) -> dict:
+    """提取相邻章节的计划摘要，不带正文。
+
+    Args:
+        document: 目录章节文档（不含正文）。
+    Returns:
+        标题、概要与章计划的公开摘要。
+    """
+    planning = document.get("planning") or {}
+    return {
+        "chapter_id": str(document["_id"]),
+        "title": document.get("title", ""),
+        "summary": document.get("summary", ""),
+        "planning": {key: planning[key] for key in (
+            "goal", "start_state", "end_state", "beats", "pov_character_id",
+            "must_include", "must_avoid", "target_word_count",
+        ) if key in planning},
+    }
+
+
+async def load_chapter_continuity_check_context(request: ChapterContinuityCheckInputV1) -> dict:
+    """在只读事务中取得原章、本章计划、父级规划与阅读顺序前文。
+
+    Args:
+        request: 固定章修订；其余资料由服务端按阅读顺序自动读取。
+    Returns:
+        原样正文、连续性资料 JSON、实际检查范围及物理来源版本；不写入资料。
+    """
+    async def read(session):
+        chapter, content = await _load_chapter_check_source(request.novel_id, request.source, session=session)
+        chain = await load_writing_parents(request.novel_id, "chapter", request.source.chapter_id, session=session)
+        # 本章计划以所选修订的快照为准，当前章计划变化不改写原检查依据。
+        revision = await BaseRepository("chapter_revisions").collection.find_one({
+            "_id": ObjectId(request.source.revision_id), "chapter_id": chapter["_id"],
+            "version": request.source.version,
+        }, session=session)
+        if revision is None:
+            raise DomainApiError("CHAPTER_RECORD_REVISION_NOT_FOUND", "所选修订不存在或不属于当前章节，请重新选择历史版本", status_code=404)
+        # Reuse the chapter-before writing snapshot so confirmed character, relation, item,
+        # faction, volume-state, and planned world-rule facts participate in continuity review.
+        from backend.services.novel.writing_context import load_writing_context
+        writing = await load_writing_context(
+            "write_chapter_by_ai", {"expected_version": chapter["version"]},
+            {"novel_id": request.novel_id, "target_type": "chapter", "target_id": request.source.chapter_id,
+             "reading_intent": "chapter_before", "reading_version": 1},
+            session=session, check_ready=False, parent_chain=chain,
+        )
+        revision_planning = revision.get("planning") or {}
+        chapter_plan = {
+            "chapter_id": str(chapter["_id"]),
+            "title": revision.get("title", chapter.get("title", "")),
+            "summary": revision.get("summary", chapter.get("summary", "")),
+            "planning": {key: revision_planning[key] for key in (
+                "goal", "start_state", "end_state", "beats", "pov_character_id",
+                "must_include", "must_avoid", "target_word_count",
+            ) if key in revision_planning},
+        }
+        parent_context = [
+            {"resource_type": kind, "id": str(document["_id"]),
+             **_continuity_extract(document, _continuity_parent_fields(kind))}
+            for kind, document in chain[:-1]
+        ]
+        # 按完整活动父链顺序定位当前章；目录不加载整书正文。
+        directories: dict[str, dict] = {}
+        for kind, collection in (("volume", "volumes"), ("arc", "arcs"), ("scene", "scenes"), ("chapter", "chapters")):
+            documents = await BaseRepository(collection).collection.find(
+                {"novel_id": ObjectId(request.novel_id), "is_deleted": False}, {"content": 0},
+                session=session).limit(10001).to_list(length=10001)
+            if len(documents) > 10000:
+                raise DomainApiError("CHAPTER_CONTINUITY_CONTEXT_TOO_LARGE", "当前小说目录过大，无法自动读取前文，请缩小写作范围", status_code=422)
+            directories[kind] = {doc["_id"]: doc for doc in documents}
+        ordered = sorted(
+            ((writing_order("chapter", doc, directories), doc) for doc in directories["chapter"].values()),
+            key=lambda item: item[0] if item[0] is not None else (),
+        )
+        ordered = [(order, doc) for order, doc in ordered if order is not None]
+        current_index = next((index for index, (_, doc) in enumerate(ordered) if doc["_id"] == chapter["_id"]), None)
+        if current_index is None:
+            raise DomainApiError("CHAPTER_CONTINUITY_POSITION_NOT_FOUND", "当前章节不在活动阅读顺序中，请刷新后重试", status_code=409)
+        previous: list[dict] = []
+        for _, doc in reversed(ordered[:current_index]):
+            if len(previous) >= CHAPTER_CONTINUITY_PREVIOUS_LIMIT:
+                break
+            full = await BaseRepository("chapters").collection.find_one(
+                {"_id": doc["_id"], "is_deleted": False}, session=session)
+            if full is None or not full.get("content", "").strip():
+                continue
+            previous.append({
+                **_continuity_plan_summary(full),
+                "excerpt": full["content"][-CHAPTER_CONTINUITY_EXCERPT_CHARACTERS:],
+                "excerpt_start": max(0, len(full["content"]) - CHAPTER_CONTINUITY_EXCERPT_CHARACTERS),
+                "content_length": len(full["content"]),
+                "truncated": len(full["content"]) > CHAPTER_CONTINUITY_EXCERPT_CHARACTERS,
+            })
+        previous.reverse()
+        next_plan = _continuity_plan_summary(ordered[current_index + 1][1]) if current_index + 1 < len(ordered) else None
+        refs_by_identity = {(kind, str(document["_id"])): CandidateSourceRefV1(
+            resource_type=kind, id=str(document["_id"]), version=document["version"])
+            for kind, document in chain}
+        for entry in previous:
+            doc = directories["chapter"][ObjectId(entry["chapter_id"])]
+            refs_by_identity[("chapter", entry["chapter_id"])] = CandidateSourceRefV1(
+                resource_type="chapter", id=entry["chapter_id"], version=doc["version"])
+        for ref in writing["source_refs"]:
+            refs_by_identity[(ref["resource_type"], ref["id"])] = CandidateSourceRefV1.model_validate(ref)
+        refs = list(refs_by_identity.values())
+        writing_context = writing["context"]
+        payload = {
+            "chapter_plan": chapter_plan,
+            "parent_context": parent_context,
+            "previous_chapters": previous,
+            "next_chapter_plan": next_plan,
+            "confirmed_context": {
+                "selected_entities": writing_context["selected_entities"],
+                "character_relations": writing_context["relations"],
+                "confirmed_volume_states": writing_context["volume_states"],
+            },
+        }
+        continuity_context = json.dumps(payload, ensure_ascii=False)
+        if len(continuity_context) > CHAPTER_CONTINUITY_CONTEXT_MAX_CHARACTERS:
+            # 前文尾段优先截短；计划与父级边界不截短。
+            for entry in previous:
+                entry["excerpt"] = entry["excerpt"][-2000:]
+                entry["excerpt_start"] = max(0, entry["content_length"] - 2000)
+                entry["truncated"] = True
+            continuity_context = json.dumps(payload, ensure_ascii=False)
+        if len(continuity_context) > CHAPTER_CONTINUITY_CONTEXT_MAX_CHARACTERS:
+            raise DomainApiError("CHAPTER_CONTINUITY_CONTEXT_BUDGET_EXCEEDED",
+                                 "连续性资料超过 60000 字符，请减少前文范围后重试；不会截短本章计划或父级边界", status_code=422)
+        checked = {
+            "chapter_id": str(chapter["_id"]),
+            "chapter_title": chapter_plan["title"],
+            "revision_version": request.source.version,
+            "previous_chapters": [
+                {"chapter_id": entry["chapter_id"], "title": entry["title"],
+                 "version": directories["chapter"][ObjectId(entry["chapter_id"])]["version"],
+                 "excerpt_start": entry["excerpt_start"], "content_length": entry["content_length"],
+                 "truncated": entry["truncated"]}
+                for entry in previous
+            ],
+            "next_chapter": ({"chapter_id": next_plan["chapter_id"], "title": next_plan["title"]}
+                             if next_plan else None),
+        }
+        return {
+            "chapter_content": content,
+            "chapter_plan": chapter_plan,
+            "parent_context": parent_context,
+            "previous_chapters": previous,
+            "next_chapter_plan": next_plan,
+            "continuity_context": continuity_context,
+            "checked_context": checked,
+            "source_refs": refs,
+        }
+
+    return await run_mongo_write_unit(read, "read_chapter_continuity_check", require_transaction=True)
+
+
+def validate_chapter_continuity_check_result(candidate: dict, data: dict) -> dict:
+    """校验疑点分类与原样引文，不判定疑点结论是否正确。
+
+    Args:
+        candidate: 模型返回的零至二十条结构化疑点。
+        data: 服务器读取的原章正文。
+    Returns:
+        严格结果；只有合法空数组才表示没有报告疑点。
+    """
+    result = ChapterContinuityCheckResultV1.model_validate(candidate)
+    content = data["chapter_content"]
+    for issue in result.issues:
         if content[issue.start:issue.start + len(issue.quote)] != issue.quote:
             raise DomainApiError("CHAPTER_CHECK_QUOTE_MISMATCH", "疑点的原文片段与所选修订的位置不一致，请重新检查", status_code=422)
     return result.model_dump(mode="json")

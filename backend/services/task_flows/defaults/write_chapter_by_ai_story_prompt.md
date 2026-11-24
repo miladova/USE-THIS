@@ -14,3 +14,8 @@
 
 本章计划、局部边界、采用原文、相关人物与事实、前文、原稿和作者要求：
 {writing_context}
+
+Mandatory private historical research dossier prepared for this chapter before drafting:
+{historical_research}
+
+Use its period/place scope, verified high-confidence facts, variation notes, and cautions. Avoid unsupported specifics and anachronisms; where research is uncertain, choose a safer non-specific detail. Do not reproduce citations or research notes in the fictional chapter unless naturally appropriate.

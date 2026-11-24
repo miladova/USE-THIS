@@ -27,6 +27,10 @@ def flow_fingerprint_inputs(task: str, generation_input: Any, snapshot: Mapping[
     flow = task_flow_store.flow_store().get(ref["id"], ref["revision"])
     if flow.task != task or flow_fingerprint(flow) != snapshot["definition_hash"]:
         raise ValueError("生成时的流程版本不存在或内容不一致")
+    if task == "write_chapter_by_ai":
+        # 确认阶段再次强制校验保存的不可变流程修订，不能用旧/自定义绕过版写入章节。
+        from .registry import validate_task_definition
+        validate_task_definition(flow)
     value = generation_input.model_dump(mode="json") if hasattr(generation_input, "model_dump") else dict(generation_input)
     chapter_version = next((node.config.get("chapter_context_version") for node in flow.nodes if node.type == "agent" and node.config.get("chapter_context_version")), None)
     if task == "write_chapter_by_ai" and (

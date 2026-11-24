@@ -16,7 +16,7 @@ from backend.services.novel.chapter_record_contract import (
     ChapterRecordSourceReadV1,
 )
 from backend.services.novel.chapter_record_service import ChapterRecordService
-from backend.services.novel.chapter_check_contract import CHAPTER_CHECK_TASK, CHAPTER_ITEM_OWNER_CHECK_TASK, CHAPTER_CHARACTER_RELATION_STATE_CHECK_TASK, CHAPTER_WORLD_RULES_CHECK_TASK
+from backend.services.novel.chapter_check_contract import CHAPTER_CHECK_TASK, CHAPTER_ITEM_OWNER_CHECK_TASK, CHAPTER_CHARACTER_RELATION_STATE_CHECK_TASK, CHAPTER_WORLD_RULES_CHECK_TASK, CHAPTER_CONTINUITY_CHECK_TASK
 from backend.services.task_flows.contracts import GraphRunRequest
 from backend.services.task_flows.integration import generate_task_flow
 
@@ -103,6 +103,22 @@ async def check_world_rules(novel_id: ObjectIdString, req: GraphRunRequest):
         return await generate_task_flow(CHAPTER_WORLD_RULES_CHECK_TASK, req, scope={"novel_id": novel_id}, stream=True)
     except EXPECTED_ERRORS as exc:
         raise_arc_http_error(exc, prefix="CHAPTER_CHECK", label="章后世界规则检查")
+
+
+@router.post("/continuity/check")
+async def check_chapter_continuity(novel_id: ObjectIdString, req: GraphRunRequest):
+    """只读检查已保存章节与前文、规划及连续性逻辑。
+
+    Args:
+        novel_id: 由路径固定的小说。
+        req: 原任务图封套及固定章修订。
+    Returns:
+        供作者审阅的证据型疑点候选，不保存报告或实体。
+    """
+    try:
+        return await generate_task_flow(CHAPTER_CONTINUITY_CHECK_TASK, req, scope={"novel_id": novel_id}, stream=True)
+    except EXPECTED_ERRORS as exc:
+        raise_arc_http_error(exc, prefix="CHAPTER_CHECK", label="章后连续性检查")
 
 
 @router.post("/item-owner/confirm", response_model=ChapterItemOwnerResultV1)

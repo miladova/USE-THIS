@@ -45,6 +45,7 @@ from backend.services.novel.chapter_check_contract import (
     CHAPTER_ITEM_OWNER_CHECK_TASK, CHAPTER_ITEM_OWNER_FACTS_CHECK_TASK, ChapterItemOwnerCheckInputV1,
     CHAPTER_CHARACTER_RELATION_STATE_CHECK_TASK, CHAPTER_CHARACTER_RELATION_FACTS_CHECK_TASK, ChapterCharacterRelationStateCheckInputV1,
     CHAPTER_WORLD_RULES_CHECK_TASK, ChapterWorldRulesCheckInputV1,
+    CHAPTER_CONTINUITY_CHECK_TASK, ChapterContinuityCheckInputV1,
 )
 
 
@@ -70,7 +71,7 @@ def prepared_task_parameters(task: str, parameters: dict[str, Any], scope: dict[
     Returns:
         最终业务参数和资料选择范围。
     """
-    if task in {CHAPTER_CHECK_TASK, CHAPTER_ITEM_OWNER_CHECK_TASK, CHAPTER_ITEM_OWNER_FACTS_CHECK_TASK, CHAPTER_CHARACTER_RELATION_STATE_CHECK_TASK, CHAPTER_CHARACTER_RELATION_FACTS_CHECK_TASK, CHAPTER_WORLD_RULES_CHECK_TASK}:
+    if task in {CHAPTER_CHECK_TASK, CHAPTER_ITEM_OWNER_CHECK_TASK, CHAPTER_ITEM_OWNER_FACTS_CHECK_TASK, CHAPTER_CHARACTER_RELATION_STATE_CHECK_TASK, CHAPTER_CHARACTER_RELATION_FACTS_CHECK_TASK, CHAPTER_WORLD_RULES_CHECK_TASK, CHAPTER_CONTINUITY_CHECK_TASK}:
         # 图中的资料和结果端口均无权更换原请求的章修订或检查目标。
         return {}, dict(scope)
     values, actual_scope = dict(parameters), dict(scope)
@@ -152,6 +153,13 @@ async def load_task_context(task: str, parameters: dict[str, Any], scope: dict[s
         return TaskContext(request, request, data, {
             "chapter_content": data["chapter_content"], "world_rules_context": data["world_rules_context"],
         }, {"checked_rules": data["rules"]})
+    if task == CHAPTER_CONTINUITY_CHECK_TASK:
+        from backend.services.novel.chapter_check_service import load_chapter_continuity_check_context
+        request = ChapterContinuityCheckInputV1.model_validate(scope)
+        data = await load_chapter_continuity_check_context(request)
+        return TaskContext(request, request, data, {
+            "chapter_content": data["chapter_content"], "continuity_context": data["continuity_context"],
+        }, {"checked_context": data["checked_context"]})
     if task in {CHAPTER_ITEM_OWNER_CHECK_TASK, CHAPTER_ITEM_OWNER_FACTS_CHECK_TASK}:
         from backend.services.novel.chapter_check_service import load_chapter_item_owner_check_context, load_chapter_item_owner_facts_check_context
         request = ChapterItemOwnerCheckInputV1.model_validate(scope)
@@ -297,6 +305,10 @@ async def validate_task_result(task: str, candidate: dict[str, Any], context: Ta
         from backend.services.novel.chapter_check_service import validate_chapter_world_rules_check_result
         assert context is not None
         return validate_chapter_world_rules_check_result(candidate, context.data)
+    if task == CHAPTER_CONTINUITY_CHECK_TASK:
+        from backend.services.novel.chapter_check_service import validate_chapter_continuity_check_result
+        assert context is not None
+        return validate_chapter_continuity_check_result(candidate, context.data)
     if task in PLOT_TASKS:
         from backend.services.novel.plot_service import validate_plot_candidate
         assert context is not None
